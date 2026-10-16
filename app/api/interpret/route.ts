@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 
-export const runtime = 'edge'; // 必须使用 edge，解除 Vercel 超时限制并支持流式直通
+export const runtime = 'edge';
 
 export async function POST(req: NextRequest) {
   try {
@@ -11,16 +11,20 @@ export async function POST(req: NextRequest) {
     const model = process.env.OPENAI_MODEL || 'deepseek-ai/DeepSeek-V3';
 
     if (!apiKey) {
-      return new Response('未配置 OPENAI_API_KEY', { status: 500 });
+      return new Response(JSON.stringify({ error: '未配置 OPENAI_API_KEY' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
-    const systemPrompt = `你是一位精通倪海厦《天纪》体系的紫微斗数命理大师。
-请结合用户提供的命盘信息、宫位吉凶星曜、四化格局进行深入、专业且通俗的推理解读。
-请直接输出解读正文，排版清晰易读。`;
+    // 提取前端传入的命盘及问题
+    const promptData = typeof body === 'string' ? body : JSON.stringify(body);
 
-    const userMessage = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+    const systemPrompt = `你是一位精通倪海厦《天纪》紫微斗数的命理大师。
+请针对用户提供的紫微斗数命盘数据、宫位吉凶星曜、四化格局进行详细、生动且深刻的推理解读。
+直接输出命理解读正文，条理分明，不要说无关的客套话。`;
 
-    // 请求硅基流动，开启流式 (stream: true)
+    // 向上游硅基流动发起请求
     const upstreamRes = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -31,7 +35,7 @@ export async function POST(req: NextRequest) {
         model: model,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `请结合以下命盘信息解读：\n\n${userMessage}` },
+          { role: 'user', content: `请帮我解读以下紫微斗数命盘：\n\n${promptData}` },
         ],
         stream: true,
       }),
@@ -39,44 +43,21 @@ export async function POST(req: NextRequest) {
 
     if (!upstreamRes.ok || !upstreamRes.body) {
       const errText = await upstreamRes.text();
-      return new Response(`大模型响应异常: ${errText}`, { status: upstreamRes.status });
+      return new Response(errText, { status: upstreamRes.status });
     }
 
-    // 将 OpenAI 格式的 SSE 数据流清洗为前端所需的逐字纯文本流
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-
-    const transformStream = new TransformStream({
-      async transform(chunk, controller) {
-        const text = decoder.decode(chunk, { stream: true });
-        const lines = text.split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-          if (trimmed === 'data: [DONE]') return;
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const json = JSON.parse(trimmed.slice(6));
-              const deltaContent = json.choices?.[0]?.delta?.content || '';
-              if (deltaContent) {
-                controller.enqueue(encoder.encode(deltaContent));
-              }
-            } catch (e) {
-              // 忽略残缺的数据包
-            }
-          }
-        }
-      },
-    });
-
-    return new Response(upstreamRes.body.pipeThrough(transformStream), {
+    // 将大模型的 SSE 原生流无损直透给前端浏览器
+    return new Response(upstreamRes.body, {
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
       },
     });
   } catch (err: any) {
-    return new Response(`服务异常: ${err.message}`, { status: 500 });
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
