@@ -1,6 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 
-export const runtime = 'edge';
+export const runtime = 'edge'; // 必须使用 edge，解除 Vercel 超时限制并支持流式直通
 
 export async function POST(req: NextRequest) {
   try {
@@ -11,59 +11,72 @@ export async function POST(req: NextRequest) {
     const model = process.env.OPENAI_MODEL || 'deepseek-ai/DeepSeek-V3';
 
     if (!apiKey) {
-      return NextResponse.json({ 
-        content: '未检测到 API Key，请检查 Vercel 环境变量配置。',
-        text: '未检测到 API Key，请检查 Vercel 环境变量配置。' 
-      }, { status: 500 });
+      return new Response('未配置 OPENAI_API_KEY', { status: 500 });
     }
 
-    // 组装 Prompt
     const systemPrompt = `你是一位精通倪海厦《天纪》体系的紫微斗数命理大师。
-请根据用户提供的命盘信息、宫位星曜、四化格局进行专业通俗的解读。
-请直接输出解读正文，不要输出多余的开场白或客套话。`;
+请结合用户提供的命盘信息、宫位吉凶星曜、四化格局进行深入、专业且通俗的推理解读。
+请直接输出解读正文，排版清晰易读。`;
 
     const userMessage = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
 
-    // 请求硅基流动大模型
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    // 请求硅基流动，开启流式 (stream: true)
+    const upstreamRes = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey.trim()}`,
       },
       body: JSON.stringify({
         model: model,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `请结合以下命盘信息进行深度推理解读：\n\n${userMessage}` },
+          { role: 'user', content: `请结合以下命盘信息解读：\n\n${userMessage}` },
         ],
-        stream: false, // 改为非流式，一次性返回完整结果，兼容性最好
+        stream: true,
       }),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return NextResponse.json({ 
-        content: `大模型请求异常: ${errText}`,
-        text: `大模型请求异常: ${errText}` 
-      }, { status: 200 });
+    if (!upstreamRes.ok || !upstreamRes.body) {
+      const errText = await upstreamRes.text();
+      return new Response(`大模型响应异常: ${errText}`, { status: upstreamRes.status });
     }
 
-    const data = await response.json();
-    const resultText = data.choices?.[0]?.message?.content || '未能生成解读内容';
+    // 将 OpenAI 格式的 SSE 数据流清洗为前端所需的逐字纯文本流
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
 
-    // 同时兼顾 content、text、message 等各种常见字段，确保前端能拿到内容
-    return NextResponse.json({
-      content: resultText,
-      text: resultText,
-      data: resultText,
-      message: resultText,
-      result: resultText,
+    const transformStream = new TransformStream({
+      async transform(chunk, controller) {
+        const text = decoder.decode(chunk, { stream: true });
+        const lines = text.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+          if (trimmed === 'data: [DONE]') return;
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const json = JSON.parse(trimmed.slice(6));
+              const deltaContent = json.choices?.[0]?.delta?.content || '';
+              if (deltaContent) {
+                controller.enqueue(encoder.encode(deltaContent));
+              }
+            } catch (e) {
+              // 忽略残缺的数据包
+            }
+          }
+        }
+      },
     });
-  } catch (error: any) {
-    return NextResponse.json({ 
-      content: `服务端异常: ${error.message}`,
-      text: `服务端异常: ${error.message}` 
-    }, { status: 500 });
+
+    return new Response(upstreamRes.body.pipeThrough(transformStream), {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+      },
+    });
+  } catch (err: any) {
+    return new Response(`服务异常: ${err.message}`, { status: 500 });
   }
 }
